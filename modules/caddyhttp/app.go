@@ -326,8 +326,13 @@ func (app *App) Provision(ctx caddy.Context) error {
 				return fmt.Errorf("loading listener wrapper modules: %v", err)
 			}
 			var hasTLSPlaceholder bool
+			var hasMixedTLS bool
+			var hasHTTPRedirect bool
 			for i, val := range vals.([]any) {
 				if _, ok := val.(*tlsPlaceholderWrapper); ok {
+					if hasMixedTLS {
+						return fmt.Errorf("mixed TLS listener wrapper cannot be combined with the TLS listener wrapper")
+					}
 					if i == 0 {
 						// putting the tls placeholder wrapper first is nonsensical because
 						// that is the default, implicit setting: without it, all wrappers
@@ -339,13 +344,31 @@ func (app *App) Provision(ctx caddy.Context) error {
 					}
 					hasTLSPlaceholder = true
 				}
+				if _, ok := val.(mixedTLSListenerWrapper); ok {
+					if hasHTTPRedirect {
+						return fmt.Errorf("mixed TLS listener wrapper cannot be combined with the HTTP redirect listener wrapper")
+					}
+					if hasMixedTLS {
+						return fmt.Errorf("mixed TLS listener wrapper can only be specified once")
+					}
+					if hasTLSPlaceholder {
+						return fmt.Errorf("mixed TLS listener wrapper must be specified before the TLS listener wrapper")
+					}
+					hasMixedTLS = true
+				}
+				if _, ok := val.(*HTTPRedirectListenerWrapper); ok && hasMixedTLS {
+					return fmt.Errorf("mixed TLS listener wrapper cannot be combined with the HTTP redirect listener wrapper")
+				}
+				if _, ok := val.(*HTTPRedirectListenerWrapper); ok {
+					hasHTTPRedirect = true
+				}
 				srv.listenerWrappers = append(srv.listenerWrappers, val.(caddy.ListenerWrapper))
 			}
 			// if any wrappers were configured but the TLS placeholder wrapper is
 			// absent, prepend it so all defined wrappers come after the TLS
 			// handshake; this simplifies logic when starting the server, since we
 			// can simply assume the TLS placeholder will always be there
-			if !hasTLSPlaceholder && len(srv.listenerWrappers) > 0 {
+			if !hasTLSPlaceholder && !hasMixedTLS && len(srv.listenerWrappers) > 0 {
 				srv.listenerWrappers = append([]caddy.ListenerWrapper{new(tlsPlaceholderWrapper)}, srv.listenerWrappers...)
 			}
 		}
@@ -588,21 +611,42 @@ func (app *App) Start() error {
 
 					// wrap listener before TLS (up to the TLS placeholder wrapper)
 					var lnWrapperIdx int
+					var mixedTLS mixedTLSListenerWrapper
+					for _, lnWrapper := range srv.listenerWrappers {
+						if wrapper, ok := lnWrapper.(mixedTLSListenerWrapper); ok {
+							mixedTLS = wrapper
+							break
+						}
+					}
 					for i, lnWrapper := range srv.listenerWrappers {
 						if _, ok := lnWrapper.(*tlsPlaceholderWrapper); ok {
 							lnWrapperIdx = i + 1 // mark the next wrapper's spot
+							break
+						}
+						if _, ok := lnWrapper.(mixedTLSListenerWrapper); ok {
+							lnWrapperIdx = i + 1
 							break
 						}
 						ln = lnWrapper.WrapListener(ln)
 					}
 
 					if useTLS {
-						// create TLS listener - this enables and terminates TLS
-						ln = tls.NewListener(ln, tlsCfg)
+						if mixedTLS != nil {
+							// mixed_tls selects plaintext HTTP or TLS per connection.
+							ln = mixedTLS.wrapTLSListener(ln, tlsCfg)
+						} else {
+							// create TLS listener - this enables and terminates TLS
+							ln = tls.NewListener(ln, tlsCfg)
+						}
+					} else if mixedTLS != nil {
+						return fmt.Errorf("mixed TLS listener wrapper requires TLS to be enabled on %s", listenAddr.At(portOffset))
 					}
 
 					// finish wrapping listener where we left off before TLS
 					for i := lnWrapperIdx; i < len(srv.listenerWrappers); i++ {
+						if _, ok := srv.listenerWrappers[i].(mixedTLSListenerWrapper); ok {
+							continue
+						}
 						ln = srv.listenerWrappers[i].WrapListener(ln)
 					}
 
